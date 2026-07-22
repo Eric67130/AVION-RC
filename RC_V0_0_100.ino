@@ -22,6 +22,23 @@ le moteur va chanter une petite mélodie (12321) et va faire défiler des option
 
 
 /*
+----------------------------
+>>> V0.0.100 du 22/07/26 <<<
+----------------------------
+- MIROIR de PL v0.0.100 : TelemetryData reçoit le champ "lidarHeightCm"
+  (uint16_t, hauteur sol mesurée par le LIDAR TF-Luna de l'avion, en cm) en
+  VRAIE fin de struct, à la suite de failSafeCount. ATTENTION CRITIQUE :
+  nécessite PL v0.0.100 ou supérieur avec la struct TelemetryData strictement
+  identique (même champ, même ordre, en fin de struct), sinon désalignement du
+  paquet LoRa (même scénario historique que pour les champs précédents). NE PAS
+  FLASHER sur la RC avant mise à jour identique de PL_V0_0_100.ino.
+- debugTransmitterData() : nouvelle ligne "[LIDAR]" affichant uniquement la
+  hauteur sol renvoyée par l'avion (en cm). Les autres données du capteur
+  (signal, température) ne sont pas transmises ni affichées.
+
+*/
+
+/*
 ---------------------------
 >>> V0.0.82 du 18/07/26 <<<
 ---------------------------
@@ -388,6 +405,11 @@ struct __attribute__((packed)) TelemetryData {
   // instable) ou stagne (les "failsafes" affichés ailleurs venaient d'autre
   // chose, ex. ralentissement du débug série).
   uint32_t failSafeCount;
+  // --- AJOUT V0.0.100 : MIROIR de PL v0.0.100. Hauteur sol (AGL) mesurée par le
+  // LIDAR TF-Luna de l'avion, en cm. DOIT rester le VRAI dernier champ de la
+  // struct, strictement identique côté PL (même type uint16_t, même position),
+  // sinon désalignement du paquet LoRa. 0 si mesure LIDAR invalide côté avion.
+  uint16_t lidarHeightCm;
 } telem;
 
 // --- AJOUT V0.0.77 : LIAISON I2C DEDIEE VERS LE XIAO DE L'AFFICHEUR ROND ---
@@ -564,6 +586,8 @@ void debugTransmitterData() {
     // affichés sous la même forme que debugControlData() côté PL. ---
     Serial.printf("BARO    | Pression: %7.2f hPa | Altitude: %6.1f m\n", telem.pressure, telem.altitude);
     Serial.printf("IMU ATT | Roll: %+7.2f ° | Pitch: %+7.2f ° | YawRate: %+7.2f °/s\n", telem.attRoll, telem.attPitch, telem.attYawRate);
+    // --- AJOUT V0.0.100 : hauteur sol LIDAR renvoyée par l'avion (seule donnée utile) ---
+    Serial.printf("[LIDAR]     Retour avion -> Hauteur: %u cm\n", telem.lidarHeightCm);
     // NOTE : contrairement à PL (qui distingue ABSENT/RECHERCHE/FIX OK via gps.charsProcessed()),
     // la RC ne reçoit que telem.gpsStatus (0/1) : pas de distinction "pas de trame" vs "recherche en cours".
     Serial.printf("GPS     | Etat: %-9s | Sats: %2d | HDOP: %4.1f | Lat: %9.5f | Lon: %9.5f | Vit: %5.1f km/h | Cap: %5.1f°\n",

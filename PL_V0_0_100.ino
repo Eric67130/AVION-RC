@@ -19,6 +19,39 @@ Ainsi, même si les servos mettent la PCA9685 à genoux, ton processeur restera 
 /*
 
 -------------------------------------
+>>> Version V0.0.100 du 22/07/2026 <<<
+-------------------------------------
+- AJOUT : intégration du LIDAR TF-Luna (I2C 0x10, sur le bus I2C_PCA partagé
+  avec le BMP280 / BMI270 / PCA9685 / OLED) pour la mesure directe de la
+  HAUTEUR SOL (AGL) à basse altitude. Fonction updateLidar() calquée sur le
+  sketch test_lidar_i2c.ino (lecture des 6 octets du bloc 0x00 : distance /
+  signal / température ; seule la distance est conservée, la température est
+  ignorée). Une mesure n'est validée que si la force du signal est suffisante
+  (>= LIDAR_MIN_STRENGTH, != 0xFFFF saturation) et la distance dans la portée
+  fiable (<= LIDAR_MAX_VALID_CM ~ 8 m).
+- ATTERRISSAGE AUTOMATIQUE : la séquence utilise désormais la hauteur LIDAR
+  comme source AGL prioritaire (getLandingAGL()) dès qu'elle est fiable
+  (basse altitude), avec repli automatique sur l'altitude barométrique
+  relative en approche haute (hors portée LIDAR). Les transitions de phase
+  (FINALE / SOL), l'arrondi (flare) et la réduction des gaz gagnent ainsi en
+  précision près du sol, là où le baro dérive le plus.
+- debugControlData() : nouvelle ligne "[LIDAR]" affichant uniquement la
+  hauteur sol en cm (les autres données du capteur ne sont pas affichées).
+- TELEMETRIE : ajout du champ "lidarHeightCm" (uint16_t, hauteur sol en cm) en
+  VRAIE fin de struct TelemetryData, renvoyé à la RC. ATTENTION CRITIQUE :
+  nécessite RC v0.0.100 ou supérieur avec la struct TelemetryData strictement
+  identique (même champ, en fin de struct), sinon désalignement du paquet LoRa
+  (même scénario historique que pour les champs précédents). À FLASHER
+  CONJOINTEMENT (PL v0.0.100 + RC v0.0.100).
+- À AJUSTER ET VALIDER EN VOL PROGRESSIF (basses altitudes d'abord) : la portée
+  utile de la TF-Luna (~8 m) et le montage du capteur (visée verticale vers le
+  sol) doivent être vérifiés avant tout usage opérationnel.
+
+*/
+
+/*
+
+-------------------------------------
 >>> Version V0.0.78 du 18/07/2026 <<<
 -------------------------------------
 - CORRECTIF MAJEUR : passage de TaskLoRaReceive() en réception NON-BLOQUANTE
@@ -464,6 +497,19 @@ float bmpAltitude = 0.0;
 float bmpTemperature = 0.0;
 const float SEA_LEVEL_HPA = 1013.25;
 
+// --- AJOUT V0.0.100 : LIDAR TF-Luna (mesure de hauteur sol / AGL) ---
+// Le capteur est câblé sur le MÊME bus I2C que les autres périphériques
+// (I2C_PCA, broches PCA_SDA/PCA_SCL), à l'adresse 0x10, distincte du BMP280
+// (0x76), du BMI270 (0x68), de la PCA9685 (0x40) et de l'OLED (0x3C).
+// Protocole de lecture identique au sketch test_lidar_i2c.ino.
+#define LIDAR_I2C_ADDR 0x10
+const uint16_t LIDAR_MIN_STRENGTH = 100;  // En-dessous : mesure peu fiable (datasheet TF-Luna)
+const uint16_t LIDAR_MAX_VALID_CM = 800;  // Portée fiable max ~8 m
+bool lidarReady = false;
+uint16_t lidarHeightCm = 0;   // Hauteur sol mesurée (cm) ; 0 si mesure invalide
+uint16_t lidarStrength = 0;   // Force du signal (sert uniquement à valider la mesure)
+bool lidarValid = false;      // Dernière mesure jugée fiable (signal + portée OK)
+
 // --- BMI270 ---
 BoschSensorClass imu(I2C_PCA);
 bool imuReady = false;
@@ -605,6 +651,10 @@ struct __attribute__((packed)) TelemetryData {
   // pour diagnostic à distance depuis la RC sans avoir besoin du port série de
   // l'avion. MIROIR RC v0.0.82 : même champ, en VRAI dernier champ de la struct.
   uint32_t failSafeCount;
+  // --- AJOUT V0.0.100 : hauteur sol (AGL) mesurée par le LIDAR TF-Luna, en cm.
+  // MIROIR RC v0.0.100 : même champ (uint16_t), en VRAI dernier champ de la
+  // struct. Renvoyé à la RC pour affichage. 0 si mesure LIDAR invalide.
+  uint16_t lidarHeightCm;
 } telem;
 
 // --- AJOUT V0.0.70 : état de réception GPS (déclaré ici, avant les variables
@@ -809,6 +859,8 @@ void debugControlData(const ControlData &data);
 void updateGPS();
 void setupLoRaFastMode();
 void updateBarometer();
+void updateLidar();      // AJOUT V0.0.100 : lecture de la hauteur sol via LIDAR TF-Luna (I2C 0x10)
+float getLandingAGL();   // AJOUT V0.0.100 : hauteur sol (m) pour l'atterrissage (LIDAR prioritaire, repli baro)
 void updateIMU();
 void applyGimbal(int panPWM, int tiltPWM);                                                          // Applique les commandes gimbal sur la PCA9685
 void showVersionOnOLED();                                                                           // Affiche le numéro de version du firmware sur l'écran OLED
@@ -1242,7 +1294,9 @@ void TaskControlFlight(void *pvParameters) {
           landWasActive = true;
         }
 
-        float agl = bmpAltitude - landHomeAltitude;  // Altitude au-dessus du sol estimée
+        // MODIFIÉ V0.0.100 : hauteur sol issue en priorité du LIDAR (mesure directe
+        // précise à basse altitude), avec repli baro au-dessus de sa portée.
+        float agl = getLandingAGL();  // Hauteur au-dessus du sol (m)
         float hdgCurrent = gps.course.isValid() ? (float)gps.course.deg() : landFinalHeading;
 
         // ---- Transitions de phase ----
@@ -1533,6 +1587,50 @@ void updateBarometer() {
   }
 }
 
+// --- AJOUT V0.0.100 : LECTURE LIDAR TF-Luna (hauteur sol) ---
+// Protocole identique au sketch test_lidar_i2c.ino, mais sur le bus I2C_PCA
+// (celui des autres capteurs) : on pointe sur le registre 0x00 puis on lit 6
+// octets (distance / signal / température). Seule la distance (= hauteur sol)
+// est conservée ; la température est ignorée (inutile ici). Une lecture n'est
+// considérée fiable (lidarValid) que si le signal est suffisant et la distance
+// dans la portée exploitable du capteur (~8 m).
+void updateLidar() {
+  if (!lidarReady) return;
+
+  I2C_PCA.beginTransmission(LIDAR_I2C_ADDR);
+  I2C_PCA.write(0x00);
+  if (I2C_PCA.endTransmission(false) != 0) return;
+
+  I2C_PCA.requestFrom((int)LIDAR_I2C_ADDR, 6);
+  if (I2C_PCA.available() < 6) return;
+
+  uint16_t distance = I2C_PCA.read() | (I2C_PCA.read() << 8);  // cm
+  uint16_t strength = I2C_PCA.read() | (I2C_PCA.read() << 8);  // force du signal
+  I2C_PCA.read();  // température (octet bas) - ignorée
+  I2C_PCA.read();  // température (octet haut) - ignorée
+
+  bool valid = (strength >= LIDAR_MIN_STRENGTH) && (strength != 0xFFFF) && (distance > 0) && (distance <= LIDAR_MAX_VALID_CM);
+
+  if (xSemaphoreTake(mutex, 0)) {
+    lidarHeightCm = distance;
+    lidarStrength = strength;
+    lidarValid = valid;
+    xSemaphoreGive(mutex);
+  }
+}
+
+// --- AJOUT V0.0.100 : HAUTEUR SOL (AGL) POUR L'ATTERRISSAGE AUTOMATIQUE ---
+// Le LIDAR fournit une mesure directe et précise de la hauteur sol, mais sur
+// une portée limitée (~8 m). On le privilégie donc dès que sa lecture est
+// fiable (phases FINALE / arrondi / SOL, où la précision compte le plus), et
+// on retombe automatiquement sur l'altitude barométrique relative
+// (bmpAltitude - landHomeAltitude) au-dessus de sa portée (approche haute).
+// Appelée sous mutex depuis TaskControlFlight().
+float getLandingAGL() {
+  if (lidarValid) return lidarHeightCm / 100.0f;
+  return bmpAltitude - landHomeAltitude;
+}
+
 void debugControlData(const ControlData &data) {
   if (Serial.availableForWrite() < 10) return;
   uint32_t now = millis();
@@ -1585,7 +1683,7 @@ void debugControlData(const ControlData &data) {
     const char *phaseStr = (landingPhase == LANDING_APPROACH) ? "APPROCHE" : (landingPhase == LANDING_FINAL) ? "FINALE"
                                                                                                              : "SOL";
     Serial.printf("AUTO LANDING | ACTIF - Phase: %-8s | AGL: %6.1f m | Dist Home: %6.1f m\n",
-                  phaseStr, bmpAltitude - landHomeAltitude,
+                  phaseStr, getLandingAGL(),
                   (float)TinyGPSPlus::distanceBetween(telem.lat, telem.lon, homeLat, homeLon));
   } else {
     Serial.printf("AUTO LANDING | Commande reçue: %s%s\n", data.autoLanding ? "ACTIF" : "OFF",
@@ -1611,6 +1709,8 @@ void debugControlData(const ControlData &data) {
   Serial.printf("SIGNAL  | RSSI Avion: %.1f dBm | SNR Avion: %.1f dB\n", lastRSSI, lastSNR);
   if (bmpReady) Serial.printf("BARO    | Pression: %7.2f hPa | Altitude: %6.1f m\n", bmpPressure, bmpAltitude);
   if (imuReady) Serial.printf("IMU ATT | Roll: %+7.2f ° | Pitch: %+7.2f ° | YawRate: %+7.2f °/s\n", imuRoll, imuPitch, imuYawRate);
+  // --- AJOUT V0.0.100 : hauteur sol LIDAR (seule donnée utile affichée) ---
+  Serial.printf("[LIDAR] Hauteur: %u cm\n", lidarHeightCm);
 
   // --- AJOUT V0.0.70 : état de réception GPS (module L76K) ---
   {
@@ -1637,6 +1737,7 @@ void TaskLoRaReceive(void *pvParameters) {
     checkGpsFixBeep();
     //updateESCTelemetry();
     updateBarometer();
+    updateLidar();  // AJOUT V0.0.100 : rafraîchit la hauteur sol (LIDAR TF-Luna)
     updateIMU();
 
     // --- AJOUT V0.0.70 : rafraîchissement périodique de l'indicateur GPS OLED ---
@@ -1701,6 +1802,8 @@ void TaskLoRaReceive(void *pvParameters) {
               // --- AJOUT V0.0.76 : compteur de failsafes, lu directement (même
               // mutex déjà pris ; failSafeCount est écrit sous mutex dans TaskControlFlight).
               telem.failSafeCount = failSafeCount;
+              // --- AJOUT V0.0.100 : hauteur sol LIDAR (cm) renvoyée à la RC ---
+              telem.lidarHeightCm = lidarHeightCm;
               xSemaphoreGive(mutex);
             }
             radio.transmit((uint8_t *)&telem, sizeof(TelemetryData));
@@ -1788,6 +1891,16 @@ void setup() {
     lastImuTime = micros();
   }
 
+  // --- AJOUT V0.0.100 : détection du LIDAR TF-Luna (I2C 0x10 sur I2C_PCA) ---
+  // Simple ACK I2C : si le capteur répond, on active sa lecture périodique.
+  I2C_PCA.beginTransmission(LIDAR_I2C_ADDR);
+  if (I2C_PCA.endTransmission() == 0) {
+    lidarReady = true;
+    Serial.println(F("[LIDAR] TF-Luna détecté (0x10)."));
+  } else {
+    Serial.println(F("[ERREUR] LIDAR TF-Luna non détecté ! Vérifier le câblage I2C."));
+  }
+
   // --- VÉRIFICATION DES CAPTEURS AU BOOT ---
   // On n'interrompt pas le démarrage (le pilotage manuel reste possible sans
   // baro/IMU), mais on prévient clairement le pilote au sol : Serial + OLED.
@@ -1815,6 +1928,7 @@ void setup() {
     telem.gimbalPan = 2048;
     telem.gimbalTilt = 2048;
     telem.autoLanding = false;
+    telem.lidarHeightCm = 0;  // AJOUT V0.0.100
     xSemaphoreGive(mutex);
   }
 
