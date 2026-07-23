@@ -25,8 +25,13 @@ Ainsi, même si les servos mettent la PCA9685 à genoux, ton processeur restera 
   Adafruit_PWMServoDriver.h mais par la librairie Seeed-PCA9685 (PCA9685.h,
   archive Seeed_PCA9685-master.zip). But : uniformiser sur la librairie Seeed.
   * #include <Adafruit_PWMServoDriver.h>  ->  #include <PCA9685.h>
-  * Objet : Adafruit_PWMServoDriver pwm(0x40, I2C_PCA)  ->  PCA9685 pwm;
-  * Init  : pwm.begin() + pwm.setPWMFreq(50)  ->  pwm.init(0x40) + pwm.setFrequency(50)
+  * Objet : Adafruit_PWMServoDriver pwm(0x40, I2C_PCA)  ->  ServoDriver pwm;
+  * Init  : pwm.begin() + pwm.setPWMFreq(50)  ->  pwm.init(0x7f) + pwm.setFrequency(50)
+  * ADRESSE I2C : 0x40 (Adafruit) -> 0x7f (defaut Seeed, confirme par le sketch
+    de reference seeed_servo_pca9685_ok.ino pousse par l'utilisateur).
+    /!\ Si un jour la carte est re-adressee, ajuster PCA9685_ADDR.
+  * On garde setPwm() (comptages precis, cf. plus bas) plutot que setAngle()
+    (uint16_t = ~11 us/degre, trop grossier pour des gouvernes pilotees en us).
 - BUS I2C : la librairie Seeed (via I2Cdev) communique UNIQUEMENT sur l'objet
   Wire global d'Arduino (aucun moyen de lui passer un TwoWire secondaire). Le
   sketch utilisait un bus dedie "I2C_PCA = TwoWire(1)" sur GPIO5/GPIO6. Comme
@@ -542,7 +547,7 @@ const float SEA_LEVEL_HPA = 1013.25;
 // --- AJOUT V0.0.100 : LIDAR TF-Luna (mesure de hauteur sol / AGL) ---
 // Le capteur est câblé sur le MÊME bus I2C que les autres périphériques
 // (I2C_PCA, broches PCA_SDA/PCA_SCL), à l'adresse 0x10, distincte du BMP280
-// (0x76), du BMI270 (0x68), de la PCA9685 (0x40) et de l'OLED (0x3C).
+// (0x76), du BMI270 (0x68), de la PCA9685 (0x7f) et de l'OLED (0x3C).
 // Protocole de lecture identique au sketch test_lidar_i2c.ino.
 #define LIDAR_I2C_ADDR 0x10
 const uint16_t LIDAR_MIN_STRENGTH = 100;  // En-dessous : mesure peu fiable (datasheet TF-Luna)
@@ -566,8 +571,10 @@ const float COMP_FILTER_ALPHA = 0.98f;
 unsigned long lastImuTime = 0;
 
 // --- MODIFIE V0.0.103 : pilote PCA9685 via la librairie Seeed-PCA9685 ---
-#define PCA9685_ADDR 0x40  // Adresse I2C du module PCA9685
-PCA9685 pwm;
+// Adresse I2C 0x7f : valeur par defaut de la carte Seeed et confirmee par le
+// sketch de reference fourni (seeed_servo_pca9685_ok.ino, ServoDriver.init(0x7f)).
+#define PCA9685_ADDR 0x7f  // Adresse I2C du module PCA9685 (Seeed)
+ServoDriver pwm;
 
 // Conversion microsecondes -> comptage 12 bits (0-4095) de la PCA9685 a 50 Hz.
 // A 50 Hz la periode vaut 20000 us et correspond a 4096 comptages.
